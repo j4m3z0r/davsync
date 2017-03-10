@@ -1,0 +1,467 @@
+#!/usr/bin/python
+
+# BSD 3-Clause License
+# 
+# Copyright (c) 2017, James Gregory <james@james.id.au>
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+# 
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# 
+# * Neither the name of the copyright holder nor the names of its
+#   contributors may be used to endorse or promote products derived from
+#   this software without specific prior written permission.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+'''
+Simple utility to sync the contents of a remote WebDAV folder with a local one.
+'''
+
+from __future__ import print_function
+
+import sys, urllib2, base64, os.path, argparse
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+RFC_1123_FORMAT = "%a, %d %b %Y %H:%M:%S GMT"
+
+TIMEOUT = 60
+DEBUG = False
+
+# In debug mode, we ignore SSL certificates so that we can easily sniff the
+# traffic with Charles for debugging.
+if DEBUG:
+    import ssl
+
+def pathjoin(*args) :
+    '''
+    Join the given path components and normalize the result.
+    '''
+    return os.path.normpath(os.path.join(*args))
+
+class ProgressStep:
+    '''
+    For use in a 'with' block -- prints the given message on entry, and a
+    'done' message on exit.
+    '''
+    def __init__(self, msg) :
+        self.msg = msg
+
+    def __enter__(self) :
+        sys.stdout.write('%s: ' % self.msg)
+        sys.stdout.flush()
+
+    def __exit__(self, *args) :
+        sys.stdout.write('done\n')
+        sys.stdout.flush()
+
+class WebDAVRequest (urllib2.Request) :
+    '''
+    Simple extension of urllib2.Request that allows you to specify the method.
+    '''
+    def __init__(self, method, url, data=None, headers={},
+                 origin_req_host=None, unverifiable=False):
+        urllib2.Request.__init__(self, url, data, headers, origin_req_host, unverifiable)
+        self.method = method
+
+    def get_method(self) :
+        return self.method
+
+class FSEntity :
+    def __init__(self, name, mtime=None) :
+        self.name = name
+        self.mtime = mtime
+
+    def __repr__(self) :
+        return '{}({})'.format(self.__class__.__name__, self.name)
+
+class Directory (FSEntity) :
+    def __init__(self, name, mtime=None) :
+        FSEntity.__init__(self, name, mtime)
+
+class File (FSEntity) :
+    def __init__(self, name, mtime=None, byteLength=None) :
+        FSEntity.__init__(self, name, mtime)
+        self.byteLength = byteLength
+
+    def __repr__(self):
+        return 'File({}) <modified: {}, length: {}>'.format(self.name, self.mtime, self.byteLength)
+
+class FileSystem :
+    def __init__(self) :
+        pass
+
+    def ls(self, path='.', recursive=False, verbose=False) :
+        raise NotImplementedError()
+
+    def mkdir(self, dirName) :
+        raise NotImplementedError()
+
+    def rmdir(self, dirName) :
+        raise NotImplementedError()
+
+    def rm(self, fileName) :
+        raise NotImplementedError()
+
+    def upload(self, fileName, data, retries=3) :
+        raise NotImplementedError()
+    
+    def download(self, fileName, retries=3) :
+        raise NotImplementedError()
+
+class WebDAVFileSystem (FileSystem) :
+    def __init__(self, url, username, password) :
+        FileSystem.__init__(self)
+        self.url = url
+        self.username = username
+        self.password = password
+        self.xmlns = {
+            'D' : 'DAV:'
+        }
+
+    def _fetch(self, method, url, data=None, headers=None, retries=1) :
+        request = WebDAVRequest(method, url)
+        b64 = base64.encodestring('{}:{}'.format(self.username, self.password)).strip()
+        request.add_header('Authorization', 'Basic {}'.format(b64))
+        if headers :
+            for k, v in headers.items() :
+                request.add_header(k, v)
+
+        for r in range(retries) :
+            try :
+                if DEBUG :
+                    # Ignore SSL certs, so we can sniff with Charles.
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    result = urllib2.urlopen(request, data=data, context=ctx, timeout=TIMEOUT).read()
+
+                else :
+                    result = urllib2.urlopen(request, data=data, timeout=TIMEOUT).read()
+
+                break
+            except :
+                if r == retries - 1 :
+                    raise
+
+        return result
+
+    def ls(self, path='.', recursive=False, verbose=False) :
+        if verbose :
+            sys.stdout.write("#")
+            sys.stdout.flush()
+
+        path = os.path.normpath('./{}'.format(path))
+        if path == '.' :
+            url = self.url
+        else :
+            url = os.path.join(self.url, os.path.normpath(path))
+
+        response = self._fetch('PROPFIND', url, headers={ 'Depth' : '1' }, retries=3)
+        root = ET.fromstring(response)
+
+        result = []
+        for child in root :
+            name = urllib2.unquote(child.find('D:href', self.xmlns).text)
+
+            fullPath = os.path.normpath('./' + os.path.join(path, name))
+            isDir = child.find('.//D:iscollection', self.xmlns).text == 'true'
+            mtime = datetime.strptime(child.find('.//D:getlastmodified', self.xmlns).text, RFC_1123_FORMAT)
+
+            if isDir :
+                d = Directory(fullPath, mtime)
+                subdir = []
+                if recursive and fullPath != '/' and fullPath != path :
+                    subdir = self.ls(fullPath, recursive, verbose)
+
+                # We only add this directory element if there are no children.
+                # When there are children, this node will be reported as a
+                # child of itself.
+                if len(subdir) == 0 :
+                    result.append(d)
+                else :
+                    result += subdir
+
+            else :
+                byteLength = int(child.find('.//D:getcontentlength', self.xmlns).text)
+                f = File(fullPath, mtime, byteLength)
+                result.append(f)
+
+        if verbose :
+            sys.stdout.write("\b \b")
+            sys.stdout.flush()
+
+        return result
+
+    def mkdir(self, dirName) :
+        url = os.path.join(self.url, os.path.normpath(dirName)) + '/'
+        response = self._fetch('MKCOL', url)
+
+    def rmdir(self, dirName) :
+        url = os.path.join(self.url, os.path.normpath(dirName)) + '/'
+        response = self._fetch('DELETE', url)
+
+    def rm(self, fileName) :
+        url = os.path.join(self.url, os.path.normpath(fileName))
+        response = self._fetch('DELETE', url)
+
+    def upload(self, fileName, data, retries=3) :
+        url = os.path.join(self.url, os.path.normpath(fileName))
+        response = self._fetch('PUT', url, data=data, headers={ 'Content-Type' : 'application/octet-stream' }, retries=3)
+
+    def download(self, fileName, retries=3) :
+        url = os.path.join(self.url, os.path.normpath(fileName))
+        return self._fetch('GET', url)
+
+class LocalFilesystem(FileSystem) :
+    def __init__(self):
+        FileSystem.__init__(self)
+
+    def ls(self, path='.', recursive=False, verbose=False):
+        result = []
+        progressString = ''
+        for root, dirnames, filenames in os.walk(path) :
+            # Indicate progress by showing walk depth by counting '/' characters in input.
+            c = len(progressString)
+            sys.stdout.write('\b' * c + ' ' * c + '\b' * c)
+            c = root.count('/') + 1
+            progressString = '#' * c
+            sys.stdout.write(progressString)
+            sys.stdout.flush()
+
+            if root != '.' :
+                s = os.stat(root)
+                mtime = datetime.utcfromtimestamp(s.st_mtime)
+                result.append(Directory(os.path.normpath(root), mtime))
+            for f in filenames :
+                name = os.path.normpath(os.path.join(root, f))
+                s = os.stat(name)
+                mtime = datetime.utcfromtimestamp(s.st_mtime)
+                result.append(File(name, mtime, s.st_size))
+
+        # Clear the progress indicator:
+        c = len(progressString)
+        sys.stdout.write('\b' * c + ' ' * c + '\b' * c)
+        sys.stdout.flush()
+
+        return result
+
+    def mkdir(self, dirName) :
+        os.mkdir(dirName)
+
+    def rmdir(self, dirName) :
+        os.rmdir(dirName)
+
+    def rm(self, fileName) :
+        os.unlink(fileName)
+
+    def upload(self, fileName, data, retries=3) :
+        with open(fileName, 'w') as f :
+            f.write(data)
+
+    def download(self, fileName, retries=3) :
+        with open(fileName, 'r') as f :
+            return f.read()
+
+class SyncPlan :
+    def __init__(self, synced, toSync, toAdd, toDelete):
+        self.synced = synced
+        self.toSync = toSync
+        self.toAdd = toAdd
+        self.toDelete = toDelete
+
+class Syncer :
+    def __init__(self, srcFS, dstFS):
+        self.srcFS = srcFS
+        self.dstFS = dstFS
+        self.curProgressString = ''
+
+    def _diff(self, lfiles, rfiles):
+        synced = [] # files that are already up to date
+        toSync = [] # files that exist on the remote end but do not match the local contents
+        toAdd = [] # files that exist locally, but do not exist on the remote end
+        toDelete = [] # files that exist on the remote end, but do not exist locally
+
+        i, j = 0, 0
+        while i < len(lfiles) and j < len(rfiles):
+            l = lfiles[i]
+            r = rfiles[j]
+            c = cmp(l.name, r.name)
+            if c == 0 :
+
+                # Names match, may need to update.
+                if isinstance(l, File) :
+                    if l.byteLength == r.byteLength :
+                        synced.append(l)
+                    else :
+                        toSync.append(l)
+                else :
+                    synced.append(l)
+
+                i += 1
+                j += 1
+
+            elif c == -1 :
+                # the file exists locally, but not remotely.
+                toAdd.append(l)
+                i += 1
+
+            elif c == 1 :
+                # the file exists remotely, but not locally.
+                toDelete.append(r)
+                j += 1
+
+        if i < len(lfiles) :
+            toAdd += lfiles[i:]
+
+        if j < len(rfiles) :
+            toDelete += rfiles[j:]
+
+        plan = SyncPlan(synced, toSync, toAdd, toDelete)
+        return plan
+
+    def _buildSyncPlan(self, originEntities, originPrefix, targetEntities, targetPrefix):
+        createFiles = []
+        createDirs = []
+        rmFiles = []
+        rmDirs = []
+
+        originEntities.sort(lambda a, b: cmp(a.name, b.name))
+        targetEntities.sort(lambda a, b: cmp(a.name, b.name))
+
+        # XXX: Need to handle case where an entity is a file in one set and a directory in the other.
+        originDirs = [ d for d in originEntities if isinstance(d, Directory) ]
+        originFiles = [ f for f in originEntities if isinstance(f, File) ]
+        remoteDirs = [ d for d in targetEntities if isinstance(d, Directory) ]
+        remoteFiles = [ f for f in targetEntities if isinstance(f, File) ]
+
+        # Lists of entries are sorted, so do pairwise iteration looking for differences.
+        dirPlan = self._diff(originDirs, remoteDirs)
+        filePlan = self._diff(originFiles, remoteFiles)
+
+        # Sort these lists either ascending or descending to ensure that child
+        # directories are created after their parents, and children are deleted
+        # before their parents.
+        cmpPathDepth = lambda a, b: cmp(os.path.normpath(a.name).count('/'), os.path.normpath(b.name).count('/'))
+        dirPlan.toAdd.sort(cmpPathDepth)
+        dirPlan.toDelete.sort(cmpPathDepth, reverse=True)
+
+        # Return the sync plan as a list of (function, description) tuples.
+        # Syncing then just involves iterating over this list and calling each
+        # function. The descrption can be used in displaying progress in
+        # verbose mode.
+        operations = []
+
+        # Since directories contain files, we need to ensure that directories
+        # are created before files are placed into them, and that files are
+        # removed before directories are.
+        for d in dirPlan.toAdd :
+            dst = pathjoin(targetPrefix, d.name)
+            op = lambda dst=dst: self.dstFS.mkdir(dst)
+            operations.append((op, "mkdir {}".format(d.name)))
+
+        for f in filePlan.toDelete :
+            dst = pathjoin(targetPrefix, f.name)
+            op = lambda dst=dst: self.dstFS.rm(dst)
+            operations.append((op, "rm {}".format(f.name)))
+
+        for d in dirPlan.toDelete :
+            dst = pathjoin(targetPrefix, d.name)
+            op = lambda dst=dst: self.dstFS.rmdir(dst)
+            operations.append((op, "rmdir {}".format(d.name)))
+
+        # Now all needed directories should be created, and all old files and
+        # directories should be removed. Now need to upload missing files, and
+        # re-sync changed ones.
+        for f in filePlan.toAdd :
+            src = pathjoin(originPrefix, f.name)
+            dst = pathjoin(targetPrefix, f.name)
+            op = lambda src=src,dst=dst: self.dstFS.upload(dst, self.srcFS.download(src))
+            operations.append((op, "add {}".format(f.name)))
+
+        for f in filePlan.toSync :
+            src = pathjoin(originPrefix, f.name)
+            dst = pathjoin(targetPrefix, f.name)
+            op = lambda src=src,dst=dst: self.dstFS.upload(dst, self.srcFS.download(src))
+            operations.append((op, "sync {}".format(f.name)))
+
+        return operations
+
+    def displayProgress(self, progressString) :
+        l = len(self.curProgressString)
+        sys.stdout.write('\b' * l + ' ' * l + '\b' * l)
+        sys.stdout.write(progressString)
+        sys.stdout.flush()
+        self.curProgressString = progressString
+
+    def sync(self, localPath, remotePath, verbose=True):
+        with ProgressStep('Scanning source') :
+            localFiles = self.srcFS.ls(localPath, True)
+            for l in localFiles :
+                l.name = os.path.relpath(l.name, localPath)
+
+        with ProgressStep('Scanning destination') :
+            remoteFiles = self.dstFS.ls(remotePath, True, verbose)
+            for l in remoteFiles :
+                l.name = os.path.relpath(l.name, remotePath)
+
+        syncOps = self._buildSyncPlan(localFiles, localPath, remoteFiles, remotePath)
+        nrOps = len(syncOps)
+        descLength = 40
+        for i, (op, desc) in enumerate(syncOps) :
+            # Update the progress string
+            percent = 100.0 * float(i) / float(nrOps)
+            bar = '[{0:<18}]'.format('#' * int(18 * percent / 100.0))
+            metrics = '{:3.1f}% ({}/{})'.format(percent, i + 1, nrOps)
+            info = (desc[:(descLength - 4)] + ' ...') if len(desc) > descLength else desc
+            self.displayProgress('{} {} {}'.format(bar, metrics, info))
+
+            # run the operation
+            op()
+
+def main(argv) :
+    example = 'Example: {} -l username -p password https://site.com photos wd:photos'.format(argv[0])
+    parser = argparse.ArgumentParser(epilog=example)
+    parser.add_argument('url', type=str, help='URL to sync with')
+    parser.add_argument('srcPath', type=str, help='path to sync from (use "wd:" for remote)')
+    parser.add_argument('dstPath', type=str, help='path to sync to (use "wd:" for remote)')
+    parser.add_argument('-v', '--verbose', help='use verbose output', action='store_true')
+    parser.add_argument('-l', '--login', type=str, help='login username (typically email address)')
+    parser.add_argument('-p', '--password', type=str, help='password for remote server')
+    args = parser.parse_args(argv[1:])
+
+    if sum([ int(p.startswith('wd:')) for p in [ args.srcPath, args.dstPath ] ]) != 1 :
+        parser.error('Exactly one of srcPath and dstPath should use "wd:" prefix')
+
+    filesystems, paths = [], []
+    for p in [ args.srcPath, args.dstPath ] :
+        if p.startswith('wd:') :
+            filesystems.append(WebDAVFileSystem(args.url, args.login, args.password))
+            paths.append(p[3:]) # strip 'wd:' prefix
+        else :
+            filesystems.append(LocalFilesystem())
+            paths.append(p)
+
+    syncer = Syncer(*filesystems)
+    syncer.sync(*paths + [ args.verbose ])
+
+if __name__ == '__main__' :
+    main(sys.argv)
+
