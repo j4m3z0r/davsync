@@ -36,19 +36,25 @@ Simple utility to sync the contents of a remote WebDAV folder with a local one.
 
 from __future__ import print_function
 
+DEBUG = False
+MULTITHREADED = True
+NUM_WORKERS = 4
+
 import sys, urllib2, base64, os.path, argparse
 import xml.etree.ElementTree as ET
-from datetime import datetime
-
-RFC_1123_FORMAT = "%a, %d %b %Y %H:%M:%S GMT"
-
-TIMEOUT = 60
-DEBUG = False
+from datetime import datetime, timedelta
 
 # In debug mode, we ignore SSL certificates so that we can easily sniff the
 # traffic with Charles for debugging.
 if DEBUG:
     import ssl
+
+if MULTITHREADED :
+    import threading, Queue
+
+RFC_1123_FORMAT = "%a, %d %b %Y %H:%M:%S GMT"
+
+TIMEOUT = 60
 
 # Number of retries on retryable operations
 RETRIES = 3
@@ -58,6 +64,10 @@ RETRIES = 3
 RETRY_WAIT = 60
 
 # Units -- used for calculating progress display
+KB = 1024
+MB = KB * KB
+DAY = timedelta(days=1)
+
 def pathjoin(*args) :
     '''
     Join the given path components and normalize the result.
@@ -227,18 +237,22 @@ class WebDAVFileSystem (FileSystem) :
     def mkdir(self, dirName) :
         url = os.path.join(self.url, os.path.normpath(dirName)) + '/'
         response = self._fetch('MKCOL', url)
+        return 0
 
     def rmdir(self, dirName) :
         url = os.path.join(self.url, os.path.normpath(dirName)) + '/'
         response = self._fetch('DELETE', url)
+        return 0
 
     def rm(self, fileName) :
         url = os.path.join(self.url, os.path.normpath(fileName))
         response = self._fetch('DELETE', url)
+        return 0
 
     def upload(self, fileName, data, retries=RETRIES) :
         url = os.path.join(self.url, os.path.normpath(fileName))
         response = self._fetch('PUT', url, data=data, headers={ 'Content-Type' : 'application/octet-stream' }, retries=retries)
+        return len(data)
 
     def download(self, fileName, retries=RETRIES) :
         url = os.path.join(self.url, os.path.normpath(fileName))
@@ -279,16 +293,20 @@ class LocalFilesystem(FileSystem) :
 
     def mkdir(self, dirName) :
         os.mkdir(dirName)
+        return 0
 
     def rmdir(self, dirName) :
         os.rmdir(dirName)
+        return 0
 
     def rm(self, fileName) :
         os.unlink(fileName)
+        return 0
 
     def upload(self, fileName, data, retries=RETRIES) :
         with open(fileName, 'w') as f :
             f.write(data)
+        return len(data)
 
     def download(self, fileName, retries=RETRIES) :
         with open(fileName, 'r') as f :
@@ -305,7 +323,16 @@ class Syncer :
     def __init__(self, srcFS, dstFS):
         self.srcFS = srcFS
         self.dstFS = dstFS
+
+        # state used to report progress.
+        self.stateLock = threading.Lock()
         self.curProgressString = ''
+        self.nrJobsTotal = 0 # total number of jobs for this sync
+        self.nrJobsComplete = 0 # number of those jobs that have completed.
+        self.bytesSyncTotal = 0 # total bytes to send/recv for this sync
+        self.bytesSyncComplete = 0 # number of those bytes that have completed.
+        self.workerTransferRates = {}
+        self.bpsSamples = []
 
     def _diff(self, lfiles, rfiles):
         synced = [] # files that are already up to date
@@ -352,6 +379,12 @@ class Syncer :
         return plan
 
     def _buildSyncPlan(self, originEntities, originPrefix, targetEntities, targetPrefix):
+        '''
+        Return a list of tasks to be performed to complete the sync. Each entry
+        will either be a single operation, or a list of operations. If it is a
+        list, then all the operations that list contains are able to be
+        performed in parallel.
+        '''
         createFiles = []
         createDirs = []
         rmFiles = []
@@ -390,31 +423,44 @@ class Syncer :
             dst = pathjoin(targetPrefix, d.name)
             op = lambda dst=dst: self.dstFS.mkdir(dst)
             operations.append((op, "mkdir {}".format(d.name)))
+            self.nrJobsTotal += 1
 
+        deleteOps = []
         for f in filePlan.toDelete :
             dst = pathjoin(targetPrefix, f.name)
             op = lambda dst=dst: self.dstFS.rm(dst)
-            operations.append((op, "rm {}".format(f.name)))
+            deleteOps.append((op, "rm {}".format(f.name)))
+            self.nrJobsTotal += 1
+
+        operations.append(deleteOps)
 
         for d in dirPlan.toDelete :
             dst = pathjoin(targetPrefix, d.name)
             op = lambda dst=dst: self.dstFS.rmdir(dst)
             operations.append((op, "rmdir {}".format(d.name)))
+            self.nrJobsTotal += 1
 
         # Now all needed directories should be created, and all old files and
         # directories should be removed. Now need to upload missing files, and
         # re-sync changed ones.
+        uploadOps = []
         for f in filePlan.toAdd :
             src = pathjoin(originPrefix, f.name)
             dst = pathjoin(targetPrefix, f.name)
             op = lambda src=src,dst=dst: self.dstFS.upload(dst, self.srcFS.download(src))
-            operations.append((op, "add {}".format(f.name)))
+            uploadOps.append((op, "add {}".format(f.name)))
+            self.nrJobsTotal += 1
+            self.bytesSyncTotal += f.byteLength
 
         for f in filePlan.toSync :
             src = pathjoin(originPrefix, f.name)
             dst = pathjoin(targetPrefix, f.name)
             op = lambda src=src,dst=dst: self.dstFS.upload(dst, self.srcFS.download(src))
-            operations.append((op, "sync {}".format(f.name)))
+            uploadOps.append((op, "sync {}".format(f.name)))
+            self.nrJobsTotal += 1
+            self.bytesSyncTotal += f.byteLength
+
+        operations.append(uploadOps)
 
         return operations
 
@@ -424,6 +470,95 @@ class Syncer :
         sys.stdout.write(progressString)
         sys.stdout.flush()
         self.curProgressString = progressString
+
+    def updateProgressString(self, desc) :
+        # Compute the total transfer rate across all threads. This is a sum of
+        # the last reported transfer rate across all worker threads. Highly
+        # imperfect, but hopefully will give directional guidance on overall
+        # performance.
+        aggregateBytesPerSecond = 0
+        for tid, bps in self.workerTransferRates.items() :
+            aggregateBytesPerSecond += bps
+
+        # compute the average transfer rate over the last n samples per worker,
+        # with n = 10 * number of workers. Current method of estimating
+        # throughput is pretty noisy, so this helps smooth it out a bit.
+        self.bpsSamples.append(aggregateBytesPerSecond)
+        numSamples = NUM_WORKERS *10 
+        self.bpsSamples = self.bpsSamples[-numSamples:]
+        averageBytesPerSecond = float(sum(self.bpsSamples)) / len(self.bpsSamples)
+
+        if averageBytesPerSecond > MB :
+            perfString = '{:.2f} MB/sec'.format(averageBytesPerSecond / MB)
+        elif averageBytesPerSecond > KB :
+            perfString = '{:.1f} KB/sec'.format(averageBytesPerSecond / KB)
+        else :
+            perfString = '{:.1f} bytes/sec'.format(averageBytesPerSecond)
+
+        etaSeconds = (self.bytesSyncTotal - self.bytesSyncComplete) / averageBytesPerSecond
+        eta = timedelta(seconds=timedelta(seconds=etaSeconds).seconds)
+
+        # Update the progress string
+        descLength = 40
+        percent = 100.0 * float(self.nrJobsComplete) / float(self.nrJobsTotal)
+        bar = '[{0:<8}]'.format('#' * int(8 * percent / 100.0))
+        metrics = '{:3.1f}% ({}/{}) {} ETA: {}'.format(percent, self.nrJobsComplete, self.nrJobsTotal, perfString, eta)
+        info = (desc[:(descLength - 4)] + ' ...') if len(desc) > descLength else desc
+        self.displayProgress('{} {} {}'.format(bar, metrics, info))
+
+    def runSyncJob(self, job) :
+        (op, desc) = job
+
+        # run the operation
+        start = datetime.utcnow()
+        bytesTransferred = op()
+        end = datetime.utcnow()
+
+        # Compute the transfer rate
+        seconds = (end - start).total_seconds()
+        bytesPerSecond = bytesTransferred / seconds
+
+        with self.stateLock :
+            self.workerTransferRates[threading.currentThread().ident] = bytesPerSecond
+            self.nrJobsComplete += 1
+            self.updateProgressString(desc)
+
+    def runParallelizableSyncJobs(self, jobs) :
+        '''
+        Run a group of jobs that have been flagged as being paralleliable, and
+        return the number of jobs completed. If the MULTITHREADED flag has been
+        set, the jobs will be run in multiple threads to speed things up.
+        '''
+        with self.stateLock :
+            self.workerTransferRates = {}
+
+        if not MULTITHREADED :
+            for j in jobs :
+                self.runSyncJob(j)
+            return
+
+        q = Queue.Queue()
+        for j in jobs :
+            q.put(j)
+
+        jobsCompleted = 0
+        def runJobs() :
+            while True :
+                try :
+                    job = q.get(False)
+                except Queue.Empty :
+                    return
+
+                self.runSyncJob(job)
+
+        threads = []
+        for _ in range(NUM_WORKERS) :
+            t = threading.Thread(target=runJobs)
+            t.start()
+            threads.append(t)
+
+        for t in threads :
+            t.join()
 
     def sync(self, localPath, remotePath, verbose=True):
         with ProgressStep('Scanning source') :
@@ -437,18 +572,11 @@ class Syncer :
                 l.name = os.path.relpath(l.name, remotePath)
 
         syncOps = self._buildSyncPlan(localFiles, localPath, remoteFiles, remotePath)
-        nrOps = len(syncOps)
-        descLength = 40
-        for i, (op, desc) in enumerate(syncOps) :
-            # Update the progress string
-            percent = 100.0 * float(i) / float(nrOps)
-            bar = '[{0:<18}]'.format('#' * int(18 * percent / 100.0))
-            metrics = '{:3.1f}% ({}/{})'.format(percent, i + 1, nrOps)
-            info = (desc[:(descLength - 4)] + ' ...') if len(desc) > descLength else desc
-            self.displayProgress('{} {} {}'.format(bar, metrics, info))
-
-            # run the operation
-            op()
+        for job in syncOps :
+            if isinstance(job, list) :
+                self.runParallelizableSyncJobs(job)
+            else :
+                self.runSyncJob(job)
 
 def main(argv) :
     example = 'Example: {} -l username -p password https://site.com photos wd:photos'.format(argv[0])
