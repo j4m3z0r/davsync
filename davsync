@@ -501,7 +501,7 @@ class Syncer :
         # Update the progress string
         descLength = 40
         percent = 100.0 * float(self.nrJobsComplete) / float(self.nrJobsTotal)
-        bar = '[{0:<8}]'.format('#' * int(8 * percent / 100.0))
+        bar = '[{0:<10}]'.format('#' * int(10 * percent / 100.0))
         metrics = '{:3.1f}% ({}/{}) {} ETA: {}'.format(percent, self.nrJobsComplete, self.nrJobsTotal, perfString, eta)
         info = (desc[:(descLength - 4)] + ' ...') if len(desc) > descLength else desc
         self.displayProgress('{} {} {}'.format(bar, metrics, info))
