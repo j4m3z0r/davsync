@@ -50,6 +50,14 @@ DEBUG = False
 if DEBUG:
     import ssl
 
+# Number of retries on retryable operations
+RETRIES = 3
+
+# Number of seconds to wait after a failure before retrying. Each retry will
+# double the wait period.
+RETRY_WAIT = 60
+
+# Units -- used for calculating progress display
 def pathjoin(*args) :
     '''
     Join the given path components and normalize the result.
@@ -120,10 +128,10 @@ class FileSystem :
     def rm(self, fileName) :
         raise NotImplementedError()
 
-    def upload(self, fileName, data, retries=3) :
+    def upload(self, fileName, data, retries=RETRIES) :
         raise NotImplementedError()
     
-    def download(self, fileName, retries=3) :
+    def download(self, fileName, retries=RETRIES) :
         raise NotImplementedError()
 
 class WebDAVFileSystem (FileSystem) :
@@ -144,6 +152,7 @@ class WebDAVFileSystem (FileSystem) :
             for k, v in headers.items() :
                 request.add_header(k, v)
 
+        retryWait = RETRY_WAIT
         for r in range(retries) :
             try :
                 if DEBUG :
@@ -161,6 +170,11 @@ class WebDAVFileSystem (FileSystem) :
                 if r == retries - 1 :
                     raise
 
+                # If we get an error, wait before retrying. Double the wait
+                # period each time.
+                threading._sleep(retryWait)
+                retryWait *= 2
+
         return result
 
     def ls(self, path='.', recursive=False, verbose=False) :
@@ -174,7 +188,7 @@ class WebDAVFileSystem (FileSystem) :
         else :
             url = os.path.join(self.url, os.path.normpath(path))
 
-        response = self._fetch('PROPFIND', url, headers={ 'Depth' : '1' }, retries=3)
+        response = self._fetch('PROPFIND', url, headers={ 'Depth' : '1' }, retries=RETRIES)
         root = ET.fromstring(response)
 
         result = []
@@ -222,11 +236,11 @@ class WebDAVFileSystem (FileSystem) :
         url = os.path.join(self.url, os.path.normpath(fileName))
         response = self._fetch('DELETE', url)
 
-    def upload(self, fileName, data, retries=3) :
+    def upload(self, fileName, data, retries=RETRIES) :
         url = os.path.join(self.url, os.path.normpath(fileName))
-        response = self._fetch('PUT', url, data=data, headers={ 'Content-Type' : 'application/octet-stream' }, retries=3)
+        response = self._fetch('PUT', url, data=data, headers={ 'Content-Type' : 'application/octet-stream' }, retries=retries)
 
-    def download(self, fileName, retries=3) :
+    def download(self, fileName, retries=RETRIES) :
         url = os.path.join(self.url, os.path.normpath(fileName))
         return self._fetch('GET', url)
 
@@ -272,11 +286,11 @@ class LocalFilesystem(FileSystem) :
     def rm(self, fileName) :
         os.unlink(fileName)
 
-    def upload(self, fileName, data, retries=3) :
+    def upload(self, fileName, data, retries=RETRIES) :
         with open(fileName, 'w') as f :
             f.write(data)
 
-    def download(self, fileName, retries=3) :
+    def download(self, fileName, retries=RETRIES) :
         with open(fileName, 'r') as f :
             return f.read()
 
