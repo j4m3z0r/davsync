@@ -511,8 +511,11 @@ class Syncer :
         else :
             perfString = '{:.1f} bytes/sec'.format(averageBytesPerSecond)
 
-        etaSeconds = (self.bytesSyncTotal - self.bytesSyncComplete) / averageBytesPerSecond
-        eta = timedelta(seconds=timedelta(seconds=etaSeconds).seconds)
+        try :
+            etaSeconds = (self.bytesSyncTotal - self.bytesSyncComplete) / averageBytesPerSecond
+            eta = timedelta(seconds=timedelta(seconds=etaSeconds).seconds)
+        except ZeroDivisionError :
+            eta = '???'
 
         # Update the progress string
         descLength = 40
