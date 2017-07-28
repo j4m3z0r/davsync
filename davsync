@@ -187,6 +187,23 @@ class WebDAVFileSystem (FileSystem) :
 
         return result
 
+    def isNodeCollection(self, node) :
+        '''
+        Return True if the given node represents a collection (directory).
+        False otherwise. Attempts to cover all the different ways various
+        WebDAV servers communicate this.
+        '''
+        isCollection = node.find('.//D:iscollection', self.xmlns)
+        if isCollection is not None and isCollection.text == 'true' :
+            return True
+
+        resourceType = node.find('.//D:resourcetype', self.xmlns)
+        if resourceType is not None :
+            collectionResourceType = resourceType.find('.//D:collection', self.xmlns)
+            return collectionResourceType is not None
+
+        return False
+
     def ls(self, path='.', recursive=False, verbose=False) :
         if verbose :
             sys.stdout.write("#")
@@ -206,10 +223,9 @@ class WebDAVFileSystem (FileSystem) :
             name = urllib2.unquote(child.find('D:href', self.xmlns).text)
 
             fullPath = os.path.normpath('./' + os.path.join(path, name))
-            isDir = child.find('.//D:iscollection', self.xmlns).text == 'true'
             mtime = datetime.strptime(child.find('.//D:getlastmodified', self.xmlns).text, RFC_1123_FORMAT)
 
-            if isDir :
+            if self.isNodeCollection(child) :
                 d = Directory(fullPath, mtime)
                 subdir = []
                 if recursive and fullPath != '/' and fullPath != path :
